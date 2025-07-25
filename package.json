@@ -1,0 +1,37 @@
+{
+  "name": "broly",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "ts-node-dev --respawn src/index.ts",
+    "start": "ts-node src/index.ts",
+    "build": "tsc",
+    "migrate:dev": "dotenv -e prisma/dev.env -- npx prisma migrate dev",
+    "migrate:prod": "dotenv -e prisma/prod.env -- npx prisma migrate deploy",
+    "generate": "prisma generate"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@prisma/client": "^6.12.0",
+    "@whiskeysockets/baileys": "^6.7.18",
+    "baileys": "^6.7.18",
+    "dotenv": "^17.2.1",
+    "express": "^5.1.0",
+    "node-cron": "^4.2.1",
+    "pg": "^8.16.3",
+    "prisma": "^6.12.0",
+    "qrcode-terminal": "^0.12.0",
+    "swagger-jsdoc": "^6.2.8",
+    "swagger-ui-express": "^5.0.1",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.8.3"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "dotenv-cli": "^9.0.0"
+  }
+}
