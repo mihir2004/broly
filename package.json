@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "ts-node-dev --respawn src/index.ts",
+    "dev": "nodemon --watch src --exec ts-node-dev --respawn src/index.ts",
     "start": "ts-node src/index.ts",
     "build": "tsc",
     "migrate:dev": "dotenv -e prisma/dev.env -- npx prisma migrate dev",
@@ -17,21 +17,29 @@
   "license": "ISC",
   "dependencies": {
     "@prisma/client": "^6.12.0",
+    "@prisma/extension-accelerate": "^2.0.2",
     "@whiskeysockets/baileys": "^6.7.18",
+    "axios": "^1.11.0",
     "baileys": "^6.7.18",
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
     "node-cron": "^4.2.1",
+    "openai": "^5.10.2",
     "pg": "^8.16.3",
-    "prisma": "^6.12.0",
     "qrcode-terminal": "^0.12.0",
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.1",
-    "ts-node-dev": "^2.0.0",
-    "typescript": "^5.8.3"
+    "twilio": "^5.8.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.3",
-    "dotenv-cli": "^9.0.0"
+    "@types/node": "^24.1.0",
+    "@types/qrcode-terminal": "^0.12.2",
+    "@types/swagger-jsdoc": "^6.0.4",
+    "@types/swagger-ui-express": "^4.1.8",
+    "dotenv-cli": "^9.0.0",
+    "prisma": "^6.12.0",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.8.3"
   }
 }
