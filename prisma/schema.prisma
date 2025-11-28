@@ -1,26 +1,15 @@
-generator client {
-  provider = "prisma-client-js"
-}
-
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
-model User {
-  id         String   @id @default(uuid())
-  phone      String   @unique
-  createdAt  DateTime @default(now())
-  reminders  Reminder[]
+generator client {
+  provider = "prisma-client-js"
 }
 
 model Reminder {
-  id        String   @id @default(uuid())
-  userId    String
-  message   String
-  remindAt  DateTime
-  sent      Boolean  @default(false)
-  createdAt DateTime @default(now())
-
-  user      User     @relation(fields: [userId], references: [id])
+  id       Int      @id @default(autoincrement())
+  phone    String
+  time     DateTime
+  message  String
 }
