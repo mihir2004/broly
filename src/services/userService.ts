@@ -1,21 +1,14 @@
-// User service responsible for resolving Twilio users to DB users.
+// src/services/userService.ts
 
-import { User } from "@prisma/client";
 import { prisma } from "../prisma";
 
 interface TwilioBody {
-  From?: string; // "whatsapp:+91..."
-  ProfileName?: string; // "Mihir Kasare"
+  From?: string;
+  ProfileName?: string;
   [key: string]: any;
 }
 
-/**
- * Get or create a User based on Twilio webhook payload.
- * Uses "From" (WhatsApp number) as the unique identifier.
- */
-export async function getOrCreateUserFromTwilio(
-  body: TwilioBody
-): Promise<User> {
+export async function getOrCreateUserFromTwilio(body: TwilioBody) {
   const from = body.From;
   const profileName = body.ProfileName;
 
@@ -25,13 +18,8 @@ export async function getOrCreateUserFromTwilio(
 
   const user = await prisma.user.upsert({
     where: { whatsappNumber: from },
-    update: {
-      profileName,
-    },
-    create: {
-      whatsappNumber: from,
-      profileName,
-    },
+    update: { profileName },
+    create: { whatsappNumber: from, profileName },
   });
 
   return user;
