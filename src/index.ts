@@ -40,6 +40,10 @@ const port = process.env.PORT || 3000;
  *  - time msg → parse, store in DB, confirm
  */
 app.post("/whatsapp", async (req: Request, res: Response) => {
+  console.log("👉 Incoming WhatsApp webhook:", {
+    body: req.body,
+    time: new Date().toISOString(),
+  });
   const rawBody: string | undefined = req.body.Body;
   const from: string | undefined = req.body.From;
 
