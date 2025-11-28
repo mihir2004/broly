@@ -7,9 +7,60 @@ generator client {
   provider = "prisma-client-js"
 }
 
+model User {
+  id                 Int                  @id @default(autoincrement())
+  whatsappNumber     String               @unique
+  profileName        String?
+
+  reminderCount      Int                  @default(0)
+
+  reminders          Reminder[]
+  recurringReminders RecurringReminder[]
+  weatherSubscription WeatherSubscription?
+}
+
 model Reminder {
-  id       Int      @id @default(autoincrement())
-  phone    String
-  time     DateTime
-  message  String
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id])
+
+  time      DateTime
+  message   String
+  createdAt DateTime @default(now())
+}
+
+enum RecurrenceType {
+  DAILY
+  MONTHLY
+}
+
+model RecurringReminder {
+  id             Int            @id @default(autoincrement())
+  userId         Int
+  user           User           @relation(fields: [userId], references: [id])
+
+  message        String
+  recurrenceType RecurrenceType
+
+  dayOfMonth     Int?
+
+  timeOfDay      String
+
+  active         Boolean        @default(true)
+
+  lastTriggeredAt DateTime?
+
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+}
+
+model WeatherSubscription {
+  id         Int      @id @default(autoincrement())
+  userId     Int      @unique
+  user       User     @relation(fields: [userId], references: [id])
+
+  city       String
+  active     Boolean  @default(true)
+  lastSentAt DateTime?
+  createdAt  DateTime @default(now())
 }
