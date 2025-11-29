@@ -6,7 +6,8 @@
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "prisma:migrate": "prisma migrate dev"
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:migrate:deploy": "prisma migrate deploy"
   },
   "keywords": [],
   "author": "",
@@ -43,7 +44,7 @@
     "@types/swagger-ui-express": "^4.1.8",
     "@types/twilio": "^3.19.3",
     "dotenv-cli": "^9.0.0",
-    "prisma": "^6.12.0",
+    "prisma": "^6.19.0",
     "ts-node-dev": "^2.0.0",
     "typescript": "^5.9.3"
   },
