@@ -9,6 +9,8 @@ import { prisma } from "./prisma";
 import { getOrCreateUserFromTwilio } from "./services/userService";
 import { startScheduler } from "./reminders/scheduler";
 import { parseReminderWithGemini } from "./nlp/geminiReminderParser";
+import { getGmailAuthUrl, exchangeCodeForTokensAndEmail } from "./mail/mailMcp";
+import { fetchTodayMailSummary } from "./mail/mailSummary";
 
 dotenv.config();
 
@@ -156,6 +158,9 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
 
   const text = rawBody.trim();
   const lower = text.toLowerCase();
+
+  const isSummaryMailCommand =
+    lower === "summary mail" || lower === "mail summary";
 
   // Resolve user
   let user;
@@ -580,6 +585,91 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
         });
       } catch (err) {
         console.error("Error sending Twilio list message:", err);
+      }
+    }
+
+    res.type("text/xml").send("<Response></Response>");
+    return;
+  }
+
+  // SUMMARY MAIL COMMAND
+  if (isSummaryMailCommand) {
+    console.log("Summary mail request received:", {
+      from,
+      userId: user.id,
+    });
+
+    try {
+      // Try to find a real MailSummarySubscription for this user
+      const mailSub = await prisma.mailSummarySubscription.findUnique({
+        where: { userId: user.id },
+      });
+
+      let summaryText: string | null = null;
+
+      if (mailSub) {
+        // Normal path: use Gmail MCP / summary service
+        summaryText = await fetchTodayMailSummary(mailSub);
+      } else if (
+        user.profileName === "Mihir Kasare" ||
+        user.whatsappNumber === "whatsapp:+919136724826"
+      ) {
+        // Demo/mock path for you in interview: fake MCP result
+        summaryText =
+          "1. Quicksell Interview today at 9 AM for Frontend Engineer I role\n" +
+          "2. Assignment submission reminder from Prof. Sharma — due today 11:59 PM\n" +
+          '3. Code review request from Aditya — "Broly Bot Scheduler PR"\n' +
+          "4. Flight itinerary update — Bengaluru on Friday (check-in opens tonight)\n" +
+          '5. Calendar alert — "Team Standup" at 6:00 PM';
+      }
+
+      if (!summaryText) {
+        const noSummaryMsg =
+          "I couldn't generate your email summary right now. Make sure Gmail access is set up, or try again later.";
+
+        if (accountSid && authToken && fromNumber) {
+          await twilioClient.messages.create({
+            from: fromNumber,
+            to: from,
+            body: noSummaryMsg,
+          });
+        }
+
+        res.type("text/xml").send("<Response></Response>");
+        return;
+      }
+
+      const reply =
+        `📧 Daily mail summary` +
+        (user.profileName ? ` for ${user.profileName}` : "") +
+        ":\n\n" +
+        summaryText;
+
+      if (accountSid && authToken && fromNumber) {
+        await twilioClient.messages.create({
+          from: fromNumber,
+          to: from,
+          body: reply,
+        });
+      }
+    } catch (error) {
+      console.error("Error handling summary mail command:", error);
+
+      if (accountSid && authToken && fromNumber) {
+        const fallback =
+          "Something went wrong while fetching your mail summary. Please try again later.";
+        try {
+          await twilioClient.messages.create({
+            from: fromNumber,
+            to: from,
+            body: fallback,
+          });
+        } catch (twilioErr) {
+          console.error(
+            "Error sending fallback summary mail reply:",
+            twilioErr
+          );
+        }
       }
     }
 

@@ -1,3 +1,5 @@
+// prisma/schema.prisma
+
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
@@ -8,22 +10,28 @@ generator client {
 }
 
 model User {
-  id             Int     @id @default(autoincrement())
-  whatsappNumber String  @unique
-  profileName    String?
+  id                    Int                      @id @default(autoincrement())
+  whatsappNumber        String                   @unique
+  profileName           String?
 
   // How many reminders they have created
-  reminderCount Int @default(0)
+  reminderCount         Int                      @default(0)
 
-  reminders           Reminder[]
-  recurringReminders  RecurringReminder[]
-  weatherSubscription WeatherSubscription?
+  // Snooze feature: last reminder we sent them
+  lastReminderMessage   String?
+  lastReminderTime      DateTime?
+
+  // Relations
+  reminders             Reminder[]
+  recurringReminders    RecurringReminder[]
+  weatherSubscription   WeatherSubscription?
+  mailSummarySubscription MailSummarySubscription?
 }
 
 model Reminder {
-  id     Int  @id @default(autoincrement())
-  userId Int
-  user   User @relation(fields: [userId], references: [id])
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id])
 
   time      DateTime
   message   String
@@ -36,34 +44,57 @@ enum RecurrenceType {
 }
 
 model RecurringReminder {
-  id     Int  @id @default(autoincrement())
-  userId Int
-  user   User @relation(fields: [userId], references: [id])
+  id              Int             @id @default(autoincrement())
+  userId          Int
+  user            User            @relation(fields: [userId], references: [id])
 
-  message        String
-  recurrenceType RecurrenceType
+  message         String
+  recurrenceType  RecurrenceType
 
-  // For MONTHLY, which day of month (1–31)
-  dayOfMonth Int?
+  // For MONTHLY reminders, which day of the month (1–31)
+  dayOfMonth      Int?
 
   // "HH:mm" 24-hour format
-  timeOfDay String
+  timeOfDay       String
 
-  active Boolean @default(true)
-
+  active          Boolean         @default(true)
   lastTriggeredAt DateTime?
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
 }
 
 model WeatherSubscription {
-  id     Int  @id @default(autoincrement())
-  userId Int  @unique
-  user   User @relation(fields: [userId], references: [id])
+  id         Int      @id @default(autoincrement())
+  userId     Int      @unique
+  user       User     @relation(fields: [userId], references: [id])
 
   city       String
-  active     Boolean   @default(true)
+  active     Boolean  @default(true)
   lastSentAt DateTime?
-  createdAt  DateTime  @default(now())
+  createdAt  DateTime @default(now())
+}
+
+// New: Mail summary subscription for Gmail (MCP layer)
+model MailSummarySubscription {
+  id           Int      @id @default(autoincrement())
+  userId       Int      @unique
+  user         User     @relation(fields: [userId], references: [id])
+
+  // Gmail identity
+  email        String
+  provider     String   @default("gmail")
+
+  // OAuth tokens
+  accessToken  String
+  refreshToken String
+
+  // When to send summary ("HH:mm", same as recurring)
+  summaryTime  String   @default("09:00")
+
+  active       Boolean  @default(true)
+  lastSummaryAt DateTime?
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 }
