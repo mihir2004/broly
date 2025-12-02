@@ -157,7 +157,7 @@ const parseSnoozeArgs = (tokens: string[]): SnoozeParseResult | null => {
 };
 
 interface SnoozeUserContext {
-  id: string;
+  id: number; // Prisma user.id is a number
   whatsappNumber: string;
   lastReminderMessage: string | null;
   lastReminderTime: Date | null;
@@ -202,7 +202,6 @@ const handleSnoozeCommand = async ({
   }
 
   const now = new Date();
-  // FIXED: use + offset to schedule in the future
   const snoozedTime = new Date(now.getTime() + offsetMs);
 
   try {
@@ -255,12 +254,23 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
   const text = rawBody.trim();
   const lower = text.toLowerCase();
 
-  // Resolve user (keeps your existing helper usage)
-  let user;
+  // Resolve user (use existing helper, then fetch full Prisma user to get all fields)
+  let baseUser;
   try {
-    user = await getOrCreateUserFromTwilio(body);
+    baseUser = await getOrCreateUserFromTwilio(body);
   } catch (err) {
     console.error("Failed to get or create user:", err);
+    res.status(500).send("User error");
+    return;
+  }
+
+  // Re-fetch full user from Prisma so TypeScript knows exact shape (id:number, optional fields etc.)
+  const user = await prisma.user.findUnique({
+    where: { id: baseUser.id },
+  });
+
+  if (!user) {
+    console.error("User record missing after upsert (unexpected).");
     res.status(500).send("User error");
     return;
   }
@@ -339,8 +349,8 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
       user: {
         id: user.id,
         whatsappNumber: user.whatsappNumber,
-        lastReminderMessage: user.lastReminderMessage,
-        lastReminderTime: user.lastReminderTime,
+        lastReminderMessage: (user as any).lastReminderMessage ?? null,
+        lastReminderTime: (user as any).lastReminderTime ?? null,
       },
       restTokens,
       from,
@@ -627,7 +637,7 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
     return;
   }
 
-  // --- NLP first attempt (if lookslike reminder and not explicitly asking for help) ---
+  // --- NLP first attempt (if looks like reminder and not explicitly asking for help) ---
   const shouldTryNLPFirst =
     !isHelp && (!session || isExperienced) && looksLikeReminderSentence;
 
@@ -671,7 +681,7 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
                 userId: user.id,
                 message: parsed.reminderMessage,
                 recurrenceType,
-                dayOfMonth: dayOfMonth ?? undefined,
+                dayOfMonth: (dayOfMonth ?? undefined) as number | undefined,
                 timeOfDay,
               },
             }),
@@ -730,7 +740,6 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
       } else {
         console.log("Gemini could not confidently parse reminder:", parsed);
 
-        // fallback to simple relative parse (e.g., "in 5 minutes")
         const relative = parseSimpleRelativeReminder(text);
         if (relative) {
           await prisma.$transaction([
@@ -766,8 +775,7 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
     }
   }
 
-  // --- Step-by-step flow (greeting should start this for ANY user) ---
-  // 1) If the user greets, start the interactive flow (works for any user)
+  // --- Step-by-step flow (greeting should start for ANY user) ---
   if (isGreeting) {
     sessions[from] = { stage: "awaiting_message" };
     responseMessage = buildWelcomeMessage(user.profileName);
@@ -776,7 +784,6 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
     return;
   }
 
-  // 2) If user is currently in a session, handle it (regardless of isExperienced)
   if (session) {
     if (session.stage === "awaiting_message") {
       sessions[from] = {
@@ -845,7 +852,7 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
     }
   }
 
-  // --- Fallback for experienced users (no session) / generic fallback ---
+  // --- Fallbacks ---
   if (!session && isExperienced && !responseMessage) {
     responseMessage =
       `I could not figure out a reminder from that, ${
@@ -859,7 +866,6 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
       `Or type "help" to see all options.`;
   }
 
-  // final generic fallback (covers new users who didn't say "hi" but didn't match anything else)
   if (!responseMessage) {
     responseMessage =
       "I did not quite understand that.\nYou can:\n" +
