@@ -1,5 +1,4 @@
 // src/index.ts
-
 import express, { Request, Response } from "express";
 import bodyParser from "body-parser";
 import twilio, { Twilio } from "twilio";
@@ -13,7 +12,6 @@ import { parseReminderWithGemini } from "./nlp/geminiReminderParser";
 dotenv.config();
 
 const app = express();
-
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 
@@ -31,76 +29,63 @@ if (!accountSid || !authToken || !fromNumber) {
 
 const twilioClient: Twilio = twilio(accountSid || "", authToken || "");
 
-// Conversation session state for step-by-step reminders
+// --- Session state (in-memory; keyed by Twilio 'From' value) ---
 type SessionStage = "awaiting_message" | "awaiting_time";
-
 interface SessionState {
   stage: SessionStage;
   message?: string;
 }
-
 const sessions: Record<string, SessionState> = {};
-
-// Weather city prompt sessions: user -> expecting city name
 const weatherCitySessions: Record<string, boolean> = {};
 
-// Help message includes weather
-const HELP_MESSAGE = `
-I am Broly, your WhatsApp reminder buddy.
+// --- Help / Welcome messages ---
+const HELP_MESSAGE = `I am Broly, your WhatsApp reminder buddy.
 
-Here is what I can do right now:
+Commands / usage:
+• "hi" - start guided step-by-step reminder setup (works for all users)
+• Natural: "remind me to call mom at 5pm"
+• "list" - show active reminders/subscriptions
+• "cancel <id>" or "cancel recurring <id>"
+• "subscribe weather <city>" or "subscribe weather"
+• "cancel weather" / "unsubscribe weather"
 
-1) Quick one-time reminders with natural language:
-   - "remind me to drink water at 5pm"
-   - "remind me to call mom tomorrow at 9 am"
-   - "remind me about app running on 5th Jan at 7 pm"
-
-2) Recurring reminders (subscriptions):
-   - "remind me to pay rent on 5th of every month at 9 am"
-   - "remind me to go for a walk every day at 7 pm"
-
-3) Daily weather updates at 9am:
-   - "subscribe weather Mumbai"
-   - "subscribe weather Bangalore"
-   - "subscribe weather" (reuse your last city or I will ask you)
-   - To stop: "cancel weather" or "unsubscribe weather"
-
-4) Step-by-step reminders (time-based, today by default):
-   - Send "hi"
-   - I will ask: what should I remind you about?
-   - Then I will ask: at what time? (for example "9:30 PM" or "21:30")
-   - I will set it for today, or tomorrow if that time has already passed.
-
-5) Commands:
-   - "hi" / "hello" / "hey" – start step-by-step reminder setup
-   - "help" – show this help message
-   - "list" – see your active one-time reminders, recurring reminders, and weather subscription
-   - "cancel <id>" – cancel a one-time reminder by its id
-   - "cancel recurring <id>" – cancel a recurring reminder by its id
-   - "cancel weather" / "unsubscribe weather" – stop daily weather updates
+Snooze:
+• "snooze 10 minutes" or "snooze 1 hour"
 `.trim();
 
 function buildWelcomeMessage(name?: string | null): string {
   const who = name ? ` ${name}` : "";
   return (
     `Hey${who}! I am Broly, your reminder assistant.\n` +
-    `You can talk to me in two ways:\n\n` +
-    `1) Natural: "remind me to submit assignment at 11pm today"\n` +
-    `2) Step-by-step: Send "hi" and I will guide you.\n\n` +
-    `You can also create recurring reminders like "remind me to pay rent on 5th of every month at 9 am".\n` +
-    `And you can subscribe to daily weather at 9am with "subscribe weather <city>".\n` +
+    `I can help you create quick reminders or guide you step-by-step.\n\n` +
+    `Try natural language: "remind me to submit assignment at 11pm today"\n` +
+    `Or send "hi" to create a reminder interactively.\n` +
     `Type "help" anytime to see all features.`
   );
 }
 
-/**
- * Simple backup parser for "in X minutes/hours".
- */
+// --- Utility: send WhatsApp message via Twilio (single place to change) ---
+const sendWhatsAppMessage = async (to: string, body: string) => {
+  if (!accountSid || !authToken || !fromNumber) {
+    console.warn("Skipping Twilio send - credentials missing.");
+    return;
+  }
+  try {
+    await twilioClient.messages.create({
+      from: fromNumber,
+      to,
+      body,
+    });
+  } catch (err) {
+    console.error("Error sending Twilio message:", err);
+  }
+};
+
+// --- Simple relative "in X minutes/hours" parser (fallback) ---
 function parseSimpleRelativeReminder(
   text: string
 ): { reminderMessage: string; datetime: Date } | null {
   const lower = text.toLowerCase();
-
   const match = lower.match(
     /in\s+(\d+)\s*(min|mins|minute|minutes|hour|hours)\b/
   );
@@ -134,7 +119,120 @@ function parseSimpleRelativeReminder(
   };
 }
 
-// Health check
+// --- Snooze helpers ---
+type SnoozeUnit = "minute" | "hour";
+interface SnoozeParseResult {
+  offsetMs: number;
+  amount: number;
+  unit: SnoozeUnit;
+}
+
+const SNOOZE_UNIT_MAP: Record<string, SnoozeUnit> = {
+  min: "minute",
+  mins: "minute",
+  minute: "minute",
+  minutes: "minute",
+  m: "minute",
+
+  h: "hour",
+  hr: "hour",
+  hrs: "hour",
+  hour: "hour",
+  hours: "hour",
+};
+
+const parseSnoozeArgs = (tokens: string[]): SnoozeParseResult | null => {
+  if (tokens.length < 2) return null;
+  const [rawAmount, ...rawUnitTokens] = tokens;
+  const amount = Number(rawAmount);
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+
+  const unitKey = rawUnitTokens.join(" ").toLowerCase();
+  const normalizedUnit = SNOOZE_UNIT_MAP[unitKey];
+  if (!normalizedUnit) return null;
+
+  const minutes = normalizedUnit === "minute" ? amount : amount * 60;
+  const offsetMs = minutes * 60 * 1000;
+  return { offsetMs, amount, unit: normalizedUnit };
+};
+
+interface SnoozeUserContext {
+  id: string;
+  whatsappNumber: string;
+  lastReminderMessage: string | null;
+  lastReminderTime: Date | null;
+}
+
+interface HandleSnoozeArgs {
+  user: SnoozeUserContext;
+  restTokens: string[];
+  from: string;
+}
+
+const handleSnoozeCommand = async ({
+  user,
+  restTokens,
+  from,
+}: HandleSnoozeArgs): Promise<void> => {
+  if (restTokens.length === 0) {
+    await sendWhatsAppMessage(
+      from,
+      'Please specify how long to snooze. Example: "snooze 10 minutes" or "snooze 1 hour".'
+    );
+    return;
+  }
+
+  const parsed = parseSnoozeArgs(restTokens);
+  if (!parsed) {
+    await sendWhatsAppMessage(
+      from,
+      'I could not understand that snooze duration. Try "snooze 10 minutes" or "snooze 2 hours".'
+    );
+    return;
+  }
+
+  const { offsetMs, amount, unit } = parsed;
+
+  if (!user.lastReminderMessage || !user.lastReminderTime) {
+    await sendWhatsAppMessage(
+      from,
+      "I don't have a recent reminder to snooze. Create a reminder first, then try snoozing."
+    );
+    return;
+  }
+
+  const now = new Date();
+  // FIXED: use + offset to schedule in the future
+  const snoozedTime = new Date(now.getTime() + offsetMs);
+
+  try {
+    await prisma.reminder.create({
+      data: {
+        userId: user.id,
+        time: snoozedTime,
+        message: user.lastReminderMessage!,
+      },
+    });
+
+    const unitLabel = unit === "minute" ? "minute" : "hour";
+    const amountWithUnit =
+      amount === 1 ? `${amount} ${unitLabel}` : `${amount} ${unitLabel}s`;
+
+    await sendWhatsAppMessage(
+      from,
+      `Got it! I'll remind you again in ${amountWithUnit} about: "${user.lastReminderMessage}".`
+    );
+  } catch (error) {
+    console.error("Error creating snoozed reminder:", error);
+    await sendWhatsAppMessage(
+      from,
+      "Something went wrong while setting your snooze. Please try again in a moment."
+    );
+  }
+};
+
+// --- Routes ---
+
 app.get("/", (_req, res) => {
   res.send("Broly Bot is running");
 });
@@ -157,7 +255,7 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
   const text = rawBody.trim();
   const lower = text.toLowerCase();
 
-  // Resolve user
+  // Resolve user (keeps your existing helper usage)
   let user;
   try {
     user = await getOrCreateUserFromTwilio(body);
@@ -168,21 +266,17 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
   }
 
   const isExperienced = user.reminderCount > 0;
-
   let responseMessage = "";
   const session = sessions[from];
 
+  // Basic flags / matches
   const isGreeting = ["hi", "hello", "hey"].includes(lower);
   const isHelp = ["help", "menu"].includes(lower);
   const isList = lower === "list" || lower === "list reminders";
   const looksLikeReminderSentence =
     lower.includes("remind") || lower.includes("reminder");
-
-  // Cancel patterns
   const cancelRecurringMatch = lower.match(/^cancel\s+recurring\s+(\d+)\b/);
   const cancelOneTimeMatch = lower.match(/^cancel\s+(\d+)\b/);
-
-  // Weather commands
   const subscribeWeatherWithCityMatch = text.match(
     /^\s*subscribe\s+weather\s+(.+)$/i
   );
@@ -190,67 +284,27 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
   const cancelWeather =
     lower === "cancel weather" || lower === "unsubscribe weather";
 
-  // 0) If user is in "waiting for weather city" mode, treat this message as city
+  // Tokens for command-first handlers (snooze, etc.)
+  const tokens = lower.split(/\s+/);
+  const [command, ...restTokens] = tokens;
+
+  // 0) If awaiting weather city prompt
   if (weatherCitySessions[from]) {
     const city = text.trim();
     delete weatherCitySessions[from];
 
     if (!city) {
-      responseMessage =
-        'I did not catch a city name. Please send something like "Mumbai" or "Bangalore".';
-    } else {
-      try {
-        const existing = await prisma.weatherSubscription.findUnique({
-          where: { userId: user.id },
-        });
-
-        if (existing) {
-          await prisma.weatherSubscription.update({
-            where: { userId: user.id },
-            data: { city, active: true },
-          });
-        } else {
-          await prisma.weatherSubscription.create({
-            data: {
-              userId: user.id,
-              city,
-            },
-          });
-        }
-
-        responseMessage = `Subscribed to daily weather updates at 9am for ${city}.`;
-      } catch (err) {
-        console.error("Error subscribing to weather after city prompt:", err);
-        responseMessage =
-          "There was an error setting up your weather subscription.";
-      }
+      await sendWhatsAppMessage(
+        from,
+        'I did not catch a city name. Please send something like "Mumbai" or "Bangalore".'
+      );
+      res.type("text/xml").send("<Response></Response>");
+      return;
     }
-
-    if (accountSid && authToken && fromNumber) {
-      try {
-        await twilioClient.messages.create({
-          from: fromNumber,
-          to: from,
-          body: responseMessage,
-        });
-      } catch (err) {
-        console.error("Error sending Twilio weather city reply:", err);
-      }
-    }
-
-    res.type("text/xml").send("<Response></Response>");
-    return;
-  }
-
-  // 1) Weather subscribe with city: "subscribe weather Mumbai"
-  if (subscribeWeatherWithCityMatch) {
-    const city = subscribeWeatherWithCityMatch[1].trim();
-
     try {
       const existing = await prisma.weatherSubscription.findUnique({
         where: { userId: user.id },
       });
-
       if (existing) {
         await prisma.weatherSubscription.update({
           where: { userId: user.id },
@@ -264,89 +318,111 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
           },
         });
       }
-
-      responseMessage = `Subscribed to daily weather updates at 9am for ${city}.`;
+      await sendWhatsAppMessage(
+        from,
+        `Subscribed to daily weather updates at 9am for ${city}.`
+      );
     } catch (err) {
-      console.error("Error subscribing to weather:", err);
-      responseMessage =
-        "There was an error setting up your weather subscription.";
+      console.error("Error subscribing to weather after city prompt:", err);
+      await sendWhatsAppMessage(
+        from,
+        "There was an error setting up your weather subscription."
+      );
     }
-
-    if (accountSid && authToken && fromNumber) {
-      try {
-        await twilioClient.messages.create({
-          from: fromNumber,
-          to: from,
-          body: responseMessage,
-        });
-      } catch (err) {
-        console.error("Error sending Twilio weather subscribe message:", err);
-      }
-    }
-
     res.type("text/xml").send("<Response></Response>");
     return;
   }
 
-  // 1b) Weather subscribe bare: "subscribe weather"
+  // SNOOZE command branch (handle early)
+  if (command === "snooze") {
+    await handleSnoozeCommand({
+      user: {
+        id: user.id,
+        whatsappNumber: user.whatsappNumber,
+        lastReminderMessage: user.lastReminderMessage,
+        lastReminderTime: user.lastReminderTime,
+      },
+      restTokens,
+      from,
+    });
+    res.type("text/xml").send("<Response></Response>");
+    return;
+  }
+
+  // Weather subscribe with city
+  if (subscribeWeatherWithCityMatch) {
+    const city = subscribeWeatherWithCityMatch[1].trim();
+    try {
+      const existing = await prisma.weatherSubscription.findUnique({
+        where: { userId: user.id },
+      });
+      if (existing) {
+        await prisma.weatherSubscription.update({
+          where: { userId: user.id },
+          data: { city, active: true },
+        });
+      } else {
+        await prisma.weatherSubscription.create({
+          data: {
+            userId: user.id,
+            city,
+          },
+        });
+      }
+      await sendWhatsAppMessage(
+        from,
+        `Subscribed to daily weather updates at 9am for ${city}.`
+      );
+    } catch (err) {
+      console.error("Error subscribing to weather:", err);
+      await sendWhatsAppMessage(
+        from,
+        "There was an error setting up your weather subscription."
+      );
+    }
+    res.type("text/xml").send("<Response></Response>");
+    return;
+  }
+
+  // Weather subscribe bare
   if (isSubscribeWeatherBare) {
     try {
       const existing = await prisma.weatherSubscription.findUnique({
         where: { userId: user.id },
       });
-
       if (existing && existing.city && existing.active) {
-        responseMessage = `You are already subscribed to daily weather updates for ${existing.city} at 9am.`;
-      } else if (existing && existing.city && !existing.active) {
-        await prisma.weatherSubscription.update({
-          where: { userId: user.id },
-          data: { active: true },
-        });
-        responseMessage = `Your daily weather updates for ${existing.city} have been reactivated.`;
-      } else if (existing && existing.city && existing.active === false) {
-        await prisma.weatherSubscription.update({
-          where: { userId: user.id },
-          data: { active: true },
-        });
-        responseMessage = `Your daily weather updates for ${existing.city} have been reactivated.`;
+        await sendWhatsAppMessage(
+          from,
+          `You are already subscribed to daily weather updates for ${existing.city} at 9am.`
+        );
       } else if (existing && existing.city) {
         await prisma.weatherSubscription.update({
           where: { userId: user.id },
           data: { active: true },
         });
-        responseMessage = `Your daily weather updates for ${existing.city} have been reactivated.`;
+        await sendWhatsAppMessage(
+          from,
+          `Your daily weather updates for ${existing.city} have been (re)activated.`
+        );
       } else {
-        // No city stored yet, ask user for city
         weatherCitySessions[from] = true;
-        responseMessage =
-          'Which city should I use for your daily weather updates? Send the city name, for example: "Mumbai".';
+        await sendWhatsAppMessage(
+          from,
+          'Which city should I use for your daily weather updates? Send the city name, for example: "Mumbai".'
+        );
       }
     } catch (err) {
       console.error("Error handling bare weather subscribe:", err);
-      responseMessage =
-        "There was an error handling your weather subscription request.";
+      await sendWhatsAppMessage(
+        from,
+        "There was an error handling your weather subscription request."
+      );
     }
-
-    if (accountSid && authToken && fromNumber) {
-      try {
-        await twilioClient.messages.create({
-          from: fromNumber,
-          to: from,
-          body: responseMessage,
-        });
-      } catch (err) {
-        console.error(
-          "Error sending Twilio weather bare subscribe message:",
-          err
-        );
-      }
-    }
-
     res.type("text/xml").send("<Response></Response>");
     return;
   }
 
-  // 2) Weather cancel
+  // Weather cancel
   if (cancelWeather) {
     try {
       const existing = await prisma.weatherSubscription.findUnique({
@@ -354,38 +430,32 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
       });
 
       if (!existing || !existing.active) {
-        responseMessage =
-          "You do not have an active weather subscription to cancel.";
+        await sendWhatsAppMessage(
+          from,
+          "You do not have an active weather subscription to cancel."
+        );
       } else {
         await prisma.weatherSubscription.update({
           where: { userId: user.id },
           data: { active: false },
         });
-        responseMessage = `Your daily weather updates for ${existing.city} have been canceled.`;
+        await sendWhatsAppMessage(
+          from,
+          `Your daily weather updates for ${existing.city} have been canceled.`
+        );
       }
     } catch (err) {
       console.error("Error canceling weather subscription:", err);
-      responseMessage =
-        "There was an error canceling your weather subscription.";
+      await sendWhatsAppMessage(
+        from,
+        "There was an error canceling your weather subscription."
+      );
     }
-
-    if (accountSid && authToken && fromNumber) {
-      try {
-        await twilioClient.messages.create({
-          from: fromNumber,
-          to: from,
-          body: responseMessage,
-        });
-      } catch (err) {
-        console.error("Error sending Twilio weather cancel message:", err);
-      }
-    }
-
     res.type("text/xml").send("<Response></Response>");
     return;
   }
 
-  // 3) Cancel recurring reminders
+  // Cancel recurring reminders
   if (cancelRecurringMatch) {
     const id = parseInt(cancelRecurringMatch[1], 10);
     if (!isNaN(id)) {
@@ -394,41 +464,38 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
           where: { id, userId: user.id, active: true },
         });
         if (!rr) {
-          responseMessage = `I could not find an active recurring reminder with id ${id} for you.`;
+          await sendWhatsAppMessage(
+            from,
+            `I could not find an active recurring reminder with id ${id} for you.`
+          );
         } else {
           await prisma.recurringReminder.update({
             where: { id: rr.id },
             data: { active: false },
           });
-          responseMessage = `Recurring reminder ${id} canceled: "${rr.message}".`;
+          await sendWhatsAppMessage(
+            from,
+            `Recurring reminder ${id} canceled: "${rr.message}".`
+          );
         }
       } catch (err) {
         console.error("Error canceling recurring reminder:", err);
-        responseMessage =
-          "There was an error canceling that recurring reminder.";
+        await sendWhatsAppMessage(
+          from,
+          "There was an error canceling that recurring reminder."
+        );
       }
     } else {
-      responseMessage =
-        "I could not understand which recurring reminder id to cancel.";
+      await sendWhatsAppMessage(
+        from,
+        "I could not understand which recurring reminder id to cancel."
+      );
     }
-
-    if (accountSid && authToken && fromNumber) {
-      try {
-        await twilioClient.messages.create({
-          from: fromNumber,
-          to: from,
-          body: responseMessage,
-        });
-      } catch (err) {
-        console.error("Error sending Twilio cancel recurring message:", err);
-      }
-    }
-
     res.type("text/xml").send("<Response></Response>");
     return;
   }
 
-  // 4) Cancel one-time reminders
+  // Cancel one-time reminders
   if (cancelOneTimeMatch) {
     const id = parseInt(cancelOneTimeMatch[1], 10);
     if (!isNaN(id)) {
@@ -437,58 +504,44 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
           where: { id, userId: user.id },
         });
         if (!r) {
-          responseMessage = `I could not find a one-time reminder with id ${id} for you.`;
+          await sendWhatsAppMessage(
+            from,
+            `I could not find a one-time reminder with id ${id} for you.`
+          );
         } else {
           await prisma.reminder.delete({
             where: { id: r.id },
           });
-          responseMessage = `One-time reminder ${id} canceled: "${r.message}".`;
+          await sendWhatsAppMessage(
+            from,
+            `One-time reminder ${id} canceled: "${r.message}".`
+          );
         }
       } catch (err) {
         console.error("Error canceling one-time reminder:", err);
-        responseMessage = "There was an error canceling that reminder.";
+        await sendWhatsAppMessage(
+          from,
+          "There was an error canceling that reminder."
+        );
       }
     } else {
-      responseMessage = "I could not understand which reminder id to cancel.";
+      await sendWhatsAppMessage(
+        from,
+        "I could not understand which reminder id to cancel."
+      );
     }
-
-    if (accountSid && authToken && fromNumber) {
-      try {
-        await twilioClient.messages.create({
-          from: fromNumber,
-          to: from,
-          body: responseMessage,
-        });
-      } catch (err) {
-        console.error("Error sending Twilio cancel message:", err);
-      }
-    }
-
     res.type("text/xml").send("<Response></Response>");
     return;
   }
 
-  // 5) Help
+  // Help
   if (isHelp) {
-    responseMessage = HELP_MESSAGE;
-
-    if (accountSid && authToken && fromNumber) {
-      try {
-        await twilioClient.messages.create({
-          from: fromNumber,
-          to: from,
-          body: responseMessage,
-        });
-      } catch (err) {
-        console.error("Error sending Twilio help message:", err);
-      }
-    }
-
+    await sendWhatsAppMessage(from, HELP_MESSAGE);
     res.type("text/xml").send("<Response></Response>");
     return;
   }
 
-  // 6) List (includes weather)
+  // List
   if (isList) {
     try {
       const now = new Date();
@@ -519,13 +572,14 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
         recurring.length === 0 &&
         !weatherSub?.active
       ) {
-        responseMessage =
-          "You do not have any active reminders or weather subscriptions right now.";
+        await sendWhatsAppMessage(
+          from,
+          "You do not have any active reminders or weather subscriptions right now."
+        );
       } else {
         const lines: string[] = [
           "Here are your active reminders and subscriptions:",
         ];
-
         if (oneTime.length > 0) {
           lines.push("", "One-time reminders:");
           for (const r of oneTime) {
@@ -536,7 +590,6 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
             );
           }
         }
-
         if (recurring.length > 0) {
           lines.push("", "Recurring reminders:");
           for (const rr of recurring) {
@@ -551,60 +604,45 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
             }
           }
         }
-
         if (weatherSub && weatherSub.active) {
           lines.push(
             "",
             `Weather subscription: daily at 09:00 for city "${weatherSub.city}".`
           );
         }
-
         lines.push(
           "",
           'To cancel, send "cancel <id>", "cancel recurring <id>", or "cancel weather".'
         );
-
-        responseMessage = lines.join("\n");
+        await sendWhatsAppMessage(from, lines.join("\n"));
       }
     } catch (err) {
       console.error("Error listing reminders:", err);
-      responseMessage = "There was an error listing your reminders.";
+      await sendWhatsAppMessage(
+        from,
+        "There was an error listing your reminders."
+      );
     }
-
-    if (accountSid && authToken && fromNumber) {
-      try {
-        await twilioClient.messages.create({
-          from: fromNumber,
-          to: from,
-          body: responseMessage,
-        });
-      } catch (err) {
-        console.error("Error sending Twilio list message:", err);
-      }
-    }
-
     res.type("text/xml").send("<Response></Response>");
     return;
   }
 
-  // 7) NLP for reminders (unchanged except string recurrence types)
-  const isGreetingWord = isGreeting;
+  // --- NLP first attempt (if lookslike reminder and not explicitly asking for help) ---
   const shouldTryNLPFirst =
     !isHelp && (!session || isExperienced) && looksLikeReminderSentence;
 
   if (shouldTryNLPFirst) {
-    const parsed = await parseReminderWithGemini(text, {
-      timezone: "Asia/Kolkata",
-    });
-
-    if (
-      parsed &&
-      parsed.intent === "create_reminder" &&
-      parsed.datetimeISO &&
-      parsed.reminderMessage &&
-      parsed.confidence >= 0.6
-    ) {
-      try {
+    try {
+      const parsed = await parseReminderWithGemini(text, {
+        timezone: "Asia/Kolkata",
+      });
+      if (
+        parsed &&
+        parsed.intent === "create_reminder" &&
+        parsed.datetimeISO &&
+        parsed.reminderMessage &&
+        parsed.confidence >= 0.6
+      ) {
         const dt = new Date(parsed.datetimeISO);
 
         const recursMonthly =
@@ -625,7 +663,6 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
           const recurrenceType: "DAILY" | "MONTHLY" = recursMonthly
             ? "MONTHLY"
             : "DAILY";
-
           const dayOfMonth = recursMonthly ? dt.getDate() : null;
 
           await prisma.$transaction([
@@ -659,6 +696,10 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
               parsed.reminderMessage
             }".`;
           }
+
+          await sendWhatsAppMessage(from, responseMessage);
+          res.type("text/xml").send("<Response></Response>");
+          return;
         } else {
           await prisma.$transaction([
             prisma.reminder.create({
@@ -681,32 +722,17 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
           }. I will remind you: "${parsed.reminderMessage}" at ${moment(
             dt
           ).format("YYYY-MM-DD HH:mm")}.`;
+
+          await sendWhatsAppMessage(from, responseMessage);
+          res.type("text/xml").send("<Response></Response>");
+          return;
         }
+      } else {
+        console.log("Gemini could not confidently parse reminder:", parsed);
 
-        if (accountSid && authToken && fromNumber) {
-          try {
-            await twilioClient.messages.create({
-              from: fromNumber,
-              to: from,
-              body: responseMessage,
-            });
-          } catch (err) {
-            console.error("Error sending Twilio message:", err);
-          }
-        }
-
-        res.type("text/xml").send("<Response></Response>");
-        return;
-      } catch (err) {
-        console.error("Error saving Gemini-parsed reminder:", err);
-        // fall through
-      }
-    } else {
-      console.log("Gemini could not confidently parse reminder:", parsed);
-
-      const relative = parseSimpleRelativeReminder(text);
-      if (relative) {
-        try {
+        // fallback to simple relative parse (e.g., "in 5 minutes")
+        const relative = parseSimpleRelativeReminder(text);
+        if (relative) {
           await prisma.$transaction([
             prisma.reminder.create({
               data: {
@@ -729,39 +755,39 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
             relative.datetime
           ).format("YYYY-MM-DD HH:mm")}.`;
 
-          if (accountSid && authToken && fromNumber) {
-            try {
-              await twilioClient.messages.create({
-                from: fromNumber,
-                to: from,
-                body: responseMessage,
-              });
-            } catch (err) {
-              console.error("Error sending Twilio message:", err);
-            }
-          }
-
+          await sendWhatsAppMessage(from, responseMessage);
           res.type("text/xml").send("<Response></Response>");
           return;
-        } catch (err) {
-          console.error("Error saving relative parsed reminder:", err);
         }
       }
+    } catch (err) {
+      console.error("Error during NLP parsing flow:", err);
+      // fall through to session / fallback below
     }
   }
 
-  // 8) Step-by-step flow for new users
-  if (!isExperienced) {
-    if (isGreeting || !session) {
-      sessions[from] = { stage: "awaiting_message" };
-      responseMessage = buildWelcomeMessage(user.profileName);
-    } else if (session.stage === "awaiting_message") {
+  // --- Step-by-step flow (greeting should start this for ANY user) ---
+  // 1) If the user greets, start the interactive flow (works for any user)
+  if (isGreeting) {
+    sessions[from] = { stage: "awaiting_message" };
+    responseMessage = buildWelcomeMessage(user.profileName);
+    await sendWhatsAppMessage(from, responseMessage);
+    res.type("text/xml").send("<Response></Response>");
+    return;
+  }
+
+  // 2) If user is currently in a session, handle it (regardless of isExperienced)
+  if (session) {
+    if (session.stage === "awaiting_message") {
       sessions[from] = {
         stage: "awaiting_time",
         message: text,
       };
       responseMessage =
         'Noted. Now tell me what time today you want this reminder.\nExamples: "9:36AM", "9:36 PM", or "14:56".';
+      await sendWhatsAppMessage(from, responseMessage);
+      res.type("text/xml").send("<Response></Response>");
+      return;
     } else if (session.stage === "awaiting_time") {
       const reminderText = session.message!;
       let reminderTime = moment(
@@ -773,59 +799,67 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
       if (!reminderTime.isValid()) {
         responseMessage =
           'I could not understand that time. Please send something like "9:36AM" or "14:56" (today only).';
-      } else {
-        const now = moment();
-        reminderTime.year(now.year()).month(now.month()).date(now.date());
-        if (reminderTime.isBefore(now)) {
-          reminderTime.add(1, "day");
-        }
-
-        try {
-          await prisma.$transaction([
-            prisma.reminder.create({
-              data: {
-                userId: user.id,
-                time: reminderTime.toDate(),
-                message: reminderText,
-              },
-            }),
-            prisma.user.update({
-              where: { id: user.id },
-              data: {
-                reminderCount: { increment: 1 },
-              },
-            }),
-          ]);
-
-          responseMessage = `All set${
-            user.profileName ? ", " + user.profileName : ""
-          }. I will remind you: "${reminderText}" at ${reminderTime.format(
-            "YYYY-MM-DD HH:mm"
-          )}.`;
-        } catch (err) {
-          console.error("Error saving reminder:", err);
-          responseMessage =
-            "I understood your reminder, but could not save it due to a database error.";
-        }
-
-        delete sessions[from];
+        await sendWhatsAppMessage(from, responseMessage);
+        res.type("text/xml").send("<Response></Response>");
+        return;
       }
-    }
-  } else {
-    if (!responseMessage) {
-      responseMessage =
-        `I could not figure out a reminder from that, ${
-          user.profileName || "friend"
-        }.\n` +
-        `Try something like:\n` +
-        `• "remind me to submit assignment at 11pm today"\n` +
-        `• "remind me to call mom tomorrow at 9am"\n` +
-        `• "remind me to pay rent on 5th of every month at 9 am"\n` +
-        `• "subscribe weather Mumbai"\n` +
-        `Or type "help" to see all options.`;
+
+      const now = moment();
+      reminderTime.year(now.year()).month(now.month()).date(now.date());
+      if (reminderTime.isBefore(now)) {
+        reminderTime.add(1, "day");
+      }
+
+      try {
+        await prisma.$transaction([
+          prisma.reminder.create({
+            data: {
+              userId: user.id,
+              time: reminderTime.toDate(),
+              message: reminderText,
+            },
+          }),
+          prisma.user.update({
+            where: { id: user.id },
+            data: {
+              reminderCount: { increment: 1 },
+            },
+          }),
+        ]);
+
+        responseMessage = `All set${
+          user.profileName ? ", " + user.profileName : ""
+        }. I will remind you: "${reminderText}" at ${reminderTime.format(
+          "YYYY-MM-DD HH:mm"
+        )}.`;
+      } catch (err) {
+        console.error("Error saving reminder:", err);
+        responseMessage =
+          "I understood your reminder, but could not save it due to a database error.";
+      }
+
+      delete sessions[from];
+      await sendWhatsAppMessage(from, responseMessage);
+      res.type("text/xml").send("<Response></Response>");
+      return;
     }
   }
 
+  // --- Fallback for experienced users (no session) / generic fallback ---
+  if (!session && isExperienced && !responseMessage) {
+    responseMessage =
+      `I could not figure out a reminder from that, ${
+        user.profileName || "friend"
+      }.\n` +
+      `Try something like:\n` +
+      `• "remind me to submit assignment at 11pm today"\n` +
+      `• "remind me to call mom tomorrow at 9am"\n` +
+      `• "remind me to pay rent on 5th of every month at 9 am"\n` +
+      `• "subscribe weather Mumbai"\n` +
+      `Or type "help" to see all options.`;
+  }
+
+  // final generic fallback (covers new users who didn't say "hi" but didn't match anything else)
   if (!responseMessage) {
     responseMessage =
       "I did not quite understand that.\nYou can:\n" +
@@ -834,21 +868,11 @@ app.post("/whatsapp", async (req: Request, res: Response) => {
       '- Or type "help" to see what I can do.';
   }
 
-  if (accountSid && authToken && fromNumber) {
-    try {
-      await twilioClient.messages.create({
-        from: fromNumber,
-        to: from,
-        body: responseMessage,
-      });
-    } catch (err) {
-      console.error("Error sending Twilio message:", err);
-    }
-  }
-
+  await sendWhatsAppMessage(from, responseMessage);
   res.type("text/xml").send("<Response></Response>");
 });
 
+// Start scheduler and server
 startScheduler();
 
 app.listen(port, () => {
